@@ -1,9 +1,13 @@
 [package]
 name = "pipedream-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A typed stream primitive for heterogeneous data routing and pipeline composition"
+description = "A typed, heterogeneous event relay with observable delivery, completion tracking, and lossless message routing"
 license = "MIT"
+repository = "https://github.com/crcn/pipedream-rs"
+keywords = ["async", "stream", "relay", "event", "messaging"]
+categories = ["asynchronous", "data-structures"]
+readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["sync", "rt"] }
