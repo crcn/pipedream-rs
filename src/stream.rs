@@ -91,6 +91,40 @@ impl Drop for Inner {
 /// Created via `ReadyGuard::new()`, signals on drop if not already signaled.
 /// IMPORTANT: After calling `signal()`, the Arc<Inner> is released to allow
 /// proper cleanup when the parent stream is dropped.
+pub struct ReadyGuard {
+    inner: Option<Arc<Inner>>,
+    signaled: bool,
+}
+
+impl ReadyGuard {
+    fn new(inner: Arc<Inner>) -> Self {
+        inner.pending_ready.fetch_add(1, Ordering::SeqCst);
+        Self {
+            inner: Some(inner),
+            signaled: false,
+        }
+    }
+
+    /// Signal that this task is ready to receive messages.
+    /// Should be called after the task is spawned and set up.
+    pub fn signal(&mut self) {
+        if !self.signaled {
+            self.signaled = true;
+            if let Some(inner) = self.inner.take() {
+                inner.ready_count.fetch_add(1, Ordering::SeqCst);
+                inner.ready_notify.notify_waiters();
+            }
+        }
+    }
+}
+
+impl Drop for ReadyGuard {
+    fn drop(&mut self) {
+        // Ensure ready is signaled even if task panics or is cancelled
+        self.signal();
+    }
+}
+
 /// Guard that decrements handler_count on drop.
 /// Ensures handler count is always decremented even if task panics or is cancelled.
 struct HandlerGuard {
@@ -738,6 +772,8 @@ impl RelayReceiver {
     }
 
     /// Subscribe with completion tracking (for internal use).
+    /// Returns (subscription, handler_count).
+    /// The subscription is immediately ready to receive messages (channel is created and buffering).
     pub fn subscribe_tracked<T: 'static + Send + Sync>(
         &self,
     ) -> (Subscription<T>, Arc<AtomicUsize>) {
@@ -747,6 +783,11 @@ impl RelayReceiver {
             .lock()
             .push(SubscriberSender::new(tx));
         self.inner.handler_count.fetch_add(1, Ordering::SeqCst);
+
+        // Signal ready immediately - the subscription can receive messages now
+        let mut ready_guard = ReadyGuard::new(self.inner.clone());
+        ready_guard.signal();
+
         (
             Subscription::new_tracked(rx),
             self.inner.handler_count.clone(),

@@ -1417,6 +1417,59 @@ async fn test_duplex_transform_chained() {
 
 */
 
+/// Test that send() doesn't block on subscriptions that signal ready immediately.
+/// Without ReadyGuard auto-signaling, this would deadlock.
+#[tokio::test]
+async fn test_send_with_immediate_ready() {
+    let relay = Relay::new();
+    let received = Arc::new(AtomicBool::new(false));
+    let received_clone = received.clone();
+
+    // Create subscription (ready is signaled automatically)
+    relay.sink(move |_msg: &String| {
+        received_clone.store(true, Ordering::SeqCst);
+    });
+
+    // Send should complete quickly without blocking
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        relay.send("test".to_string())
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "send() should not block - subscriptions signal ready immediately"
+    );
+
+    // Verify message was received
+    assert!(
+        received.load(Ordering::SeqCst),
+        "handler should have received the message"
+    );
+}
+
+/// Test that subscriptions are immediately ready
+#[tokio::test]
+async fn test_subscription_immediately_ready() {
+    let relay = Relay::new();
+
+    // Create subscription
+    relay.sink(|_msg: &String| {});
+
+    // Send should not block - subscription is ready immediately
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        relay.send("test".to_string())
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "send() should not block - subscriptions are ready immediately"
+    );
+}
+
 /* REMOVED: Duplex API no longer exists
 
 */

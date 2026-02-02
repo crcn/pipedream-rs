@@ -11,7 +11,7 @@ pub use envelope::Envelope;
 pub use error::{PanicError, RelayError};
 
 // Public channel API - the recommended way to create relays
-pub use stream::{Relay, RelayReceiver, RelaySender, SendError, WeakSender};
+pub use stream::{ReadyGuard, Relay, RelayReceiver, RelaySender, SendError, WeakSender};
 
 // Keep Subscription public for typed message receiving
 pub use subscription::Subscription;

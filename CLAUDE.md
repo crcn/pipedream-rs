@@ -52,14 +52,16 @@ src/
 - `subscribe()` returns **untracked** subscription - fire-and-forget, sender doesn't wait
 - `subscribe_tracked()` returns **tracked** subscription - sender waits for `complete_one()`
 - `sink()`/`tap()` use tracked subscriptions internally
+- Subscriptions are immediately ready when created (channel exists and can buffer)
 - Only tracked subscriptions participate in completion counting
 
 ```rust
 // Untracked - fire and forget
 let sub = relay.subscribe::<MyEvent>();
 
-// Tracked - sender waits, MUST call complete_one()
+// Tracked - sender waits for completion, MUST call complete_one()
 let (sub, handler_count) = relay.subscribe_tracked::<MyEvent>();
+
 // ... process message ...
 if let Some(tracker) = sub.current_tracker() {
     tracker.complete_one();
@@ -101,8 +103,8 @@ Errors flow two ways:
 
 1. **Every tracked handler must discharge its completion** - either `complete_one()` or `fail()`
 2. **Completion is explicit** - handlers call `complete_one()` immediately after processing
-3. **Handler count is best-effort** - concurrent registration may not be counted
-4. **Ready signals are single-consumer** - racing sends may not wait for all wiring
+3. **Subscriptions are immediately ready** - channels exist and can buffer as soon as `subscribe_tracked()` returns
+4. **send() waits for readiness** - ensures all subscriptions exist before delivering messages
 5. **Lossless delivery** - no message dropping, backpressure is expected
 
 ## Testing
@@ -132,9 +134,28 @@ Current test count: 87 tests (including 19 stress tests for race conditions)
 
 1. Use `subscribe_tracked::<T>()` - returns `(Subscription, Arc<AtomicUsize>)`, auto-increments handler_count
 2. Create `HandlerGuard` from handler_count for exception-safe decrement
-3. After processing: call `tracker.complete_one()` and `sub.clear_tracker()`
-4. On error: create `DataStreamError`, call `relay.emit_untracked(error)` and `tracker.fail(error)`
-5. HandlerGuard's Drop decrements `handler_count` when task exits
+3. Subscription is immediately ready (channel created, ready signaled automatically)
+4. After processing: call `tracker.complete_one()` and `sub.clear_tracker()`
+5. On error: create `DataStreamError`, call `relay.emit_untracked(error)` and `tracker.fail(error)`
+6. HandlerGuard's Drop decrements `handler_count` when task exits
+
+Example:
+```rust
+let (mut sub, handler_count) = relay.subscribe_tracked::<MyEvent>();
+let handler_guard = HandlerGuard::new(handler_count);
+
+tokio::spawn(async move {
+    let _guard = handler_guard;
+
+    while let Some(msg) = sub.recv().await {
+        // ... process message ...
+        if let Some(tracker) = sub.current_tracker() {
+            tracker.complete_one();
+        }
+        sub.clear_tracker();
+    }
+});
+```
 
 ## What NOT to Do
 
