@@ -4,7 +4,7 @@ This file provides guidance for AI assistants working with this codebase.
 
 ## Overview
 
-pipedream-rs is a typed, heterogeneous event relay library for Rust with:
+**pipedream-rs** is a typed, heterogeneous event relay library for Rust with:
 
 - **Lossless delivery** - if `send().await` returns Ok, message was delivered
 - Explicit completion tracking

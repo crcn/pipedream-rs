@@ -1,4 +1,4 @@
-use pipedream::{Dropped, Relay};
+use pipedream_rs::{Dropped, Relay};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;

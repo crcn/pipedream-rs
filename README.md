@@ -1,4 +1,4 @@
-# pipedream
+# pipedream-rs
 
 A typed, heterogeneous event relay library for Rust with lossless delivery, explicit lifecycle management, and error propagation.
 
@@ -19,14 +19,14 @@ A typed, heterogeneous event relay library for Rust with lossless delivery, expl
 
 ```toml
 [dependencies]
-pipedream = "0.1"
+pipedream-rs = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
 ## Quick Start
 
 ```rust
-use pipedream::Relay;
+use pipedream_rs::Relay;
 
 #[tokio::main]
 async fn main() {
@@ -191,7 +191,7 @@ rx.tap::<Event, _, _>(|e| {
 Errors from handlers are also sent through the relay:
 
 ```rust
-use pipedream::RelayError;
+use pipedream_rs::RelayError;
 
 let (tx, rx) = Relay::channel();
 
@@ -232,7 +232,7 @@ Errors in handlers flow two ways:
 2. **Through relay**: Subscribe to `RelayError` for monitoring
 
 ```rust
-use pipedream::{Relay, RelayError, SendError};
+use pipedream_rs::{Relay, RelayError, SendError};
 
 let (tx, rx) = Relay::channel();
 

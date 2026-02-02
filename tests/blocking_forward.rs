@@ -3,7 +3,7 @@
 // Closing is handled by dropping RelaySender in the new channel API.
 
 /*
-use pipedream::{PipeExt, Relay};
+use pipedream_rs::{PipeExt, Relay};
 use std::time::Duration;
 use tokio::time::timeout;
 

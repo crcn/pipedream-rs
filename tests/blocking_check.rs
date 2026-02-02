@@ -1,4 +1,4 @@
-use pipedream::Relay;
+use pipedream_rs::Relay;
 use std::time::Duration;
 use tokio::time::timeout;
 

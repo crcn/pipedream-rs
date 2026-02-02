@@ -1,5 +1,5 @@
 [package]
-name = "pipedream"
+name = "pipedream-rs"
 version = "0.1.0"
 edition = "2021"
 description = "A typed stream primitive for heterogeneous data routing and pipeline composition"
