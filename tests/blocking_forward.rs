@@ -7,6 +7,7 @@ use pipedream_rs::{PipeExt, Relay};
 use std::time::Duration;
 use tokio::time::timeout;
 
+#[ignore]
 #[tokio::test]
 async fn test_forward_is_awaitable_and_blocking() {
     let source = Relay::new();

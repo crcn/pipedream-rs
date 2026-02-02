@@ -11,10 +11,11 @@ use crate::tracker::CompletionTracker;
 /// Receives messages of type `T` from the stream.
 /// Type filtering happens locally - wrong types are skipped, not errored.
 ///
-/// ## Lossless Delivery
+/// ## Observable Delivery
 ///
-/// All subscriptions receive all messages. There is no message dropping.
-/// Slow consumers apply backpressure to senders.
+/// Subscriptions receive messages via try_send with buffering (default: 65536).
+/// If a subscriber's buffer fills, messages are dropped and observable via `Dropped` events.
+/// No backpressure - senders never block waiting for slow consumers.
 ///
 /// ## Completion Semantics
 ///

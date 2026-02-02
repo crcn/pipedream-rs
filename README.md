@@ -1,10 +1,10 @@
 # pipedream-rs
 
-A typed, heterogeneous event relay library for Rust with lossless delivery, explicit lifecycle management, and error propagation.
+A typed, heterogeneous event relay library for Rust with observable delivery, explicit lifecycle management, and error propagation.
 
 ## Features
 
-- **Lossless delivery** - if `send().await` returns Ok, message was delivered to all subscribers
+- **Observable delivery** - high throughput with observable drops via `Dropped` events
 - **Channel-based ownership** - explicit lifecycle with `RelaySender` and `RelayReceiver`
 - Single relay carries messages of any type
 - Type-based filtering and transformation
@@ -13,7 +13,31 @@ A typed, heterogeneous event relay library for Rust with lossless delivery, expl
 - **Explicit completion tracking** - `send().await` waits for tracked handlers
 - **Error propagation** from handlers back to senders
 - **Panic catching** in handlers with error reporting
-- **Backpressure** - slow consumers apply backpressure to senders
+
+## What Pipedream IS and IS NOT
+
+**Pipedream is designed for observable in-process event streaming.**
+
+### ✅ What Pipedream IS
+
+- Observable event relay with fast broadcast delivery
+- Type-safe transformations with compile-time checking
+- Explicit completion tracking for async handler coordination
+- In-process, high-throughput event streaming
+- Panic-resilient with error propagation
+
+**Best for:** logging, metrics, monitoring, in-process pub/sub, application event streaming
+
+### ❌ What Pipedream IS NOT
+
+- ❌ **A guaranteed delivery queue** - Use RabbitMQ, SQS, or disk-backed queues
+- ❌ **A replacement for Kafka / NATS** - Use those for distributed systems
+- ❌ **A transactional system** - No rollback, no exactly-once semantics
+- ❌ **A state machine runtime** - See statecharts libraries
+- ❌ **A distributed system** - Single-process only
+- ❌ **An actor framework** - No supervision trees or location transparency
+
+**The boundary:** If you need durability, distribution, or guaranteed delivery, pipedream is the wrong tool.
 
 ## Installation
 
@@ -54,7 +78,7 @@ async fn main() {
 // Create a relay channel with default buffer size (65536)
 let (tx, rx) = Relay::channel();
 
-// Custom channel size (affects backpressure threshold)
+// Custom channel size (affects drop threshold)
 let (tx, rx) = Relay::channel_with_size(128);
 
 // WeakSender - send without keeping channel alive
@@ -77,7 +101,7 @@ if tx.is_closed() {
 let (tx, rx) = Relay::channel();
 
 // Send and wait for tracked handlers to complete
-// Returns Ok only if message was delivered to all subscribers
+// Returns Ok if message was sent (drops observable via Dropped events)
 tx.send("hello".to_string()).await?;
 
 // Type-filtered subscription (untracked - send() doesn't wait for these)
@@ -276,17 +300,38 @@ rx.sink::<i32, _, _>(|n| {
 
 ## Execution Semantics
 
-### Lossless Delivery
+### Observable Delivery
 
-pipedream guarantees lossless delivery:
+pipedream provides observable delivery semantics:
 
-- **No message dropping** - every message is delivered to all subscribers
-- `send()` is async and authoritative - if it returns `Ok`, message was delivered
-- Per-subscriber MPSC channels ensure no message loss
-- **Backpressure** - slow consumers apply backpressure to senders
+- **High throughput** - messages delivered via `try_send` (non-blocking)
+- **Observable drops** - if subscriber buffer fills, drops are observable via `Dropped` events
+- **No backpressure** - senders never block waiting for slow consumers
+- `send()` is async and authoritative - if it returns `Ok`, message was sent
+- Per-subscriber MPSC channels with configurable buffer size (default: 65536)
 - Delivery happens **inside** `send()`, not in background tasks
 
-**Non-blocking:** Delivery is fully async - uses `join_all` to deliver to all subscribers concurrently. No threads are blocked. If a subscriber's channel buffer is full, only that specific delivery awaits (backpressure).
+**Monitoring:** Subscribe to `Dropped` events to observe message drops:
+
+```rust
+let mut dropped = rx.subscribe::<Dropped>();
+tokio::spawn(async move {
+    while let Some(drop) = dropped.recv().await {
+        log::warn!("Message dropped: msg_id={}", drop.msg_id);
+        metrics::increment("relay.drops", 1);
+    }
+});
+```
+
+**Buffer Tuning:** Use `channel_with_size()` to tune buffer size for your workload:
+
+```rust
+// Smaller buffer for low-latency, high-drop tolerance
+let (tx, rx) = Relay::channel_with_size(1024);
+
+// Larger buffer for high-throughput, low-drop scenarios
+let (tx, rx) = Relay::channel_with_size(131072);
+```
 
 ### Message Lifecycle
 
@@ -299,11 +344,11 @@ tx.send(msg) called
 │ 2. Await ready signals              │
 │ 3. Snapshot handler_count (N)       │
 │ 4. Create tracker expecting N       │
-│ 5. Deliver to all subscribers       │  ← Concurrent async delivery (join_all)
+│ 5. Deliver to all subscribers       │  ← try_send to each subscriber
 │ 6. Wait for tracked handlers        │
 └─────────────────────────────────────┘
     │
-    ▼ (delivered to all subscribers)
+    ▼ (sent via try_send, drops observable)
     │
 ┌───┴───┬───────┬───────┐
 ▼       ▼       ▼       ▼
@@ -418,21 +463,30 @@ Relays follow automatic cascade close:
 
 Creating a transformation on a closed relay returns a closed child immediately.
 
-## Backpressure
+## Buffer Sizing and Drop Monitoring
 
 pipedream uses per-subscriber MPSC channels with configurable buffer size:
 
-- When a subscriber's buffer is full, `send()` will wait
-- This creates natural backpressure from slow consumers
+- When a subscriber's buffer is full, messages are **dropped** (not queued)
+- Drops are observable via `Dropped` events
+- No backpressure - senders never block
 - Use `channel_with_size()` to tune buffer size for your workload
-- Larger buffers allow more burst capacity but use more memory
+- Larger buffers reduce drops but use more memory
 
 ```rust
 // Higher buffer for bursty workloads (default is 65536)
+let (tx, rx) = Relay::channel_with_size(131072);
+
+// Lower buffer when drops are acceptable
 let (tx, rx) = Relay::channel_with_size(4096);
 
-// Lower buffer for strict backpressure
-let (tx, rx) = Relay::channel_with_size(16);
+// Monitor drops
+let mut dropped = rx.subscribe::<Dropped>();
+tokio::spawn(async move {
+    while let Some(drop) = dropped.recv().await {
+        log::warn!("Dropped msg_id={}", drop.msg_id);
+    }
+});
 ```
 
 ## Example: Processing Pipeline with Error Handling

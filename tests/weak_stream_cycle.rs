@@ -1,8 +1,12 @@
+// This test has been disabled because WeakReadable functionality was removed.
+// The test was verifying that weak references to streams don't prevent the stream from being dropped.
+
+/*
 use pipedream_rs::Relay;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
+#[ignore]
 #[tokio::test]
 async fn test_weak_stream_allows_drop() {
     // 1. Create a Relay (Source)
@@ -52,3 +56,4 @@ async fn test_weak_stream_allows_drop() {
         Err(_) => panic!("Timed out - stream did not close! Weak ref is likely keeping it alive."),
     }
 }
+*/

@@ -6,7 +6,7 @@ This file provides guidance for AI assistants working with this codebase.
 
 **pipedream-rs** is a typed, heterogeneous event relay library for Rust with:
 
-- **Lossless delivery** - if `send().await` returns Ok, message was delivered
+- **Observable delivery** - if `send().await` returns Ok, message was sent (drops observable via `Dropped` events)
 - Explicit completion tracking
 - Error propagation from handlers back to senders
 - Panic catching with error reporting

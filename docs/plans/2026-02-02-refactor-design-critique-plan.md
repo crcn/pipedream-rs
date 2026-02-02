@@ -75,6 +75,48 @@ source.forward(&target).await;                       // Blocks until source clos
 7. **Echo Prevention** - Origin tracking prevents infinite loops in bidirectional pipes
 8. **Comprehensive Testing** - Stress tests, invariant tests, regression tests, soak tests
 
+## What Pipedream IS and IS NOT
+
+**Pipedream's Identity:** Observable in-process event streaming with typed heterogeneous messages.
+
+### What Pipedream IS ✅
+
+- **Observable event relay** - Fast broadcast with drop detection via `Dropped` events
+- **Type-safe transformations** - Compile-time type checking with runtime filtering
+- **Explicit completion tracking** - Coordinate async handlers with sender
+- **Panic-resilient** - Catches panics in handlers, converts to errors
+- **In-process only** - Single-process, high-throughput event streaming
+- **Heterogeneous messaging** - Multiple message types in single relay
+
+**Best for:**
+- Logging and metrics collection
+- Application event streaming
+- Monitoring and observability pipelines
+- In-process pub/sub patterns
+- High-throughput event fanout
+
+### What Pipedream IS NOT ❌
+
+Pipedream is **not** a distributed system or guaranteed delivery queue.
+
+**It is NOT:**
+- ❌ **A guaranteed delivery queue** - Use RabbitMQ, SQS, or disk-backed queues
+- ❌ **A replacement for Kafka / NATS / message brokers** - Use those for distributed systems
+- ❌ **A transactional system** - No rollback, no exactly-once semantics, no persistence
+- ❌ **A state machine runtime** - See statecharts libraries (XState, etc.)
+- ❌ **A distributed system** - Single-process only, no network transparency
+- ❌ **An actor framework** - No supervision trees, no location transparency
+- ❌ **A database** - No persistence, no queries, no durability
+
+**Use something else for:**
+- Inter-service communication (use gRPC, message brokers)
+- Durable event storage (use event stores, Kafka)
+- Distributed coordination (use etcd, Consul)
+- Reliable work queues (use Sidekiq, Celery)
+- Cross-process communication (use message brokers)
+
+**The boundary:** If your system needs durability, distribution, or guaranteed delivery, pipedream is the wrong tool.
+
 ## Critical Issues Requiring Resolution
 
 ### 1. **Documentation vs. Implementation Mismatch (CRITICAL)**
@@ -110,25 +152,26 @@ source.forward(&target).await;                       // Blocks until source clos
 - The design-doc.md is honest about broadcast behavior, but README misleads users
 - Semantic contract mismatch: library behavior doesn't match its public API documentation
 
-**Resolution Options:**
-1. **Align README with design-doc.md (simplest):**
-   - Remove "lossless delivery" and "backpressure" claims from README.md and Subscription.rs
-   - Adopt design-doc.md's honest description: "broadcast semantics with observable message loss"
+**Resolution Strategy:**
+
+**Immediate (Tier 0 - Define Identity):**
+1. **Adopt "Observable Delivery" as core identity**
+   - Remove "lossless delivery" claims from README.md and Subscription.rs
+   - Rename to "Observable Delivery" - frames drops as observability feature
    - Document `Dropped` events as the monitoring mechanism
-   - Update CLAUDE.md to reflect broadcast semantics
+   - This IS what pipedream is: observable in-process event streaming
 
-2. **Implement true lossless delivery (breaking change):**
-   - Replace `try_send` with `send().await` to block until delivery succeeds
-   - This adds genuine backpressure but may impact throughput
-   - Requires performance testing and potentially breaking API changes
+**Future (Tier 2 - Only After Real Users Prove Need):**
+2. **Consider Reliable mode as advanced opt-in**
+   - Add builder pattern with `.delivery_mode(Reliable)` if users need it
+   - **Observable** = current `try_send` behavior (THE default, THE identity)
+   - **Reliable** = `send().await` with backpressure (advanced, foot-gun territory)
+   - Frame Reliable as: "For command buses / event sourcing only. Not recommended for high fan-out."
+   - Document performance implications explicitly
 
-3. **Provide both modes (most flexible):**
-   - Add builder pattern with `.delivery_mode(Broadcast)` vs `.delivery_mode(Lossless)`
-   - Broadcast = current `try_send` behavior (default for backward compatibility)
-   - Lossless = `send().await` with true backpressure
-   - Let users choose based on their requirements
+**Recommendation:** Start with Tier 0 only. Keep Observable as pipedream's identity. Don't solve hypothetical problems. Add Reliable mode ONLY when real users prove they need it.
 
-**Recommendation:** **Option 1** - Fix the documentation to match implementation. The design-doc.md already describes the behavior correctly. Simply align README.md and Subscription.rs with that honest description. The broadcast semantics with observable drops is a valid design choice - just document it accurately.
+**Critical Insight:** Observable is not "the fast mode" - it's THE mode. Reliable is an escape hatch, not a peer.
 
 ### 2. **Ready Signal Race Conditions**
 
@@ -163,12 +206,24 @@ tokio::join!(
 
 **Resolution Options:**
 1. Add explicit `.ready().await` barrier method users must call
-2. Make ready signals multi-consumer (change from `notify_one` to `notify_waiters`)
+2. **Make ready signals multi-consumer (RECOMMENDED):** Change from `notify_one` to `notify_waiters` to create a true barrier
 3. Document limitation prominently and provide synchronization patterns
 
-**Recommendation:** Option 2 - Change to `notify_waiters()` to make it a true barrier. This matches user expectations better than best-effort semantics.
+**Recommendation:** **Option 2** - Change to `notify_waiters()` to make ready signals a proper barrier. This ensures all concurrent sends wait for wiring completion, not just one. Key benefits:
+- Eliminates race where second sender skips wiring
+- Matches user expectations for transformation setup
+- Simple implementation change with significant correctness improvement
+- Makes "ready signal" actually mean "ready for all senders"
 
-### 3. **Forwarder Task Panic Safety**
+**Implementation:**
+```rust
+// In ReadyGuard::drop()
+self.relay.ready_notify.notify_waiters();  // Was: notify_one()
+```
+
+This is a behavior change but improves correctness. Document in changelog as bug fix.
+
+### 3. **Forwarder Task Panic Safety (Supervisor Pattern)**
 
 **Problem:** Forwarder tasks in transformations (map, filter, batch) may not catch panics, potentially leaving child relays open and subscribers hanging.
 
@@ -191,11 +246,60 @@ let mapped = relay.map::<i32, i32, _>(|x| {
 - Silent forwarder task death
 - Resource leaks (unclosed relays)
 - Hangs in downstream code
+- No error propagation to sender or subscribers
 
-**Resolution:**
-- Add panic catching to all forwarder loops
-- Convert panics to `RelayError` and close child relay
-- Add explicit tests: "forwarder panics, child must still close"
+**Resolution (Supervisor Pattern):**
+
+Implement comprehensive panic handling with error emission:
+
+```rust
+// In map/filter/batch forwarder loops
+loop {
+    match parent.recv().await {
+        Some(msg) => {
+            // Catch panics in transformation
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                transform(&msg)
+            }));
+
+            match result {
+                Ok(transformed) => {
+                    // Forward successfully
+                    child.send(transformed).await.ok();
+                }
+                Err(panic_payload) => {
+                    // Emit panic as error
+                    let error = RelayError::HandlerPanic {
+                        msg_id: msg.msg_id(),
+                        type_id: TypeId::of::<T>(),
+                        payload: panic_payload,
+                    };
+                    parent.emit_untracked(error);
+
+                    // Close child and exit forwarder
+                    child.close();
+                    break;
+                }
+            }
+        }
+        None => {
+            child.close();
+            break;
+        }
+    }
+}
+```
+
+**Benefits:**
+- Panics don't leave zombie relays
+- Errors propagate to both sender and subscribers
+- Makes "Panic Resilience" claim actually true for transformations
+- Consistent with sink/tap panic handling
+
+**Tests Needed:**
+- Forwarder panics in map closure → child closes, error emitted
+- Forwarder panics in filter closure → child closes, error emitted
+- Forwarder panics in batch transform → child closes, error emitted
 
 ## Semantic Clarity Issues
 
@@ -271,27 +375,61 @@ tx.send(42).await?;  // May complete before sink registers
 
 ## API Ergonomics Improvements
 
-### 7. **Builder Pattern for Relay Configuration**
+### 7. **Builder Pattern for Configuration (Tier 2 - Post 1.0)**
 
-**Current API:**
+**Note:** Defer this until real users prove they need Reliable mode. Focus on documenting Observable semantics first.
+
+**Current API (keep as-is for now):**
 ```rust
-let (tx, rx) = Relay::channel_with_size(65536);
+let (tx, rx) = Relay::channel();               // Observable by default
+let (tx, rx) = Relay::channel_with_size(4096); // Tune buffer size
 ```
 
-**Proposed:**
+**Future (only if needed):**
 ```rust
+// Most users: Observable is pipedream's identity
+let (tx, rx) = Relay::channel();  // Observable, 65536 buffer
+
+// Advanced users only: Reliable mode
+// ⚠️  For command buses / event sourcing ONLY
+// ⚠️  Not recommended for high fan-out
 let (tx, rx) = Relay::builder()
-    .channel_size(65536)
-    .backpressure_mode(BackpressureMode::Lossless)
-    .panic_mode(PanicMode::CatchAndEmit)
+    .delivery_mode(DeliveryMode::Reliable)
+    .channel_size(1024)  // Smaller buffer OK with backpressure
     .build();
 ```
 
-**Benefits:**
-- Explicit configuration options
-- Extensible for future settings
-- Self-documenting API
-- Type-safe configuration
+**If implemented (Tier 2), frame it this way:**
+```rust
+pub enum DeliveryMode {
+    /// Observable delivery (DEFAULT - this is pipedream's identity)
+    /// - High throughput with try_send
+    /// - Drops are observable via Dropped events
+    /// - No backpressure on senders
+    /// - Use for: logging, metrics, monitoring, event streaming
+    Observable,
+
+    /// ⚠️ ADVANCED: Lossless delivery with backpressure
+    /// - send().await blocks until delivered to ALL subscribers
+    /// - Slow consumers slow down ALL senders
+    /// - ⚠️ NOT recommended for high fan-out scenarios
+    /// - Use for: command buses, event sourcing with few subscribers
+    #[doc(hidden)]  // Or similar visibility control
+    Reliable,
+}
+```
+
+**Why defer:**
+- Don't solve hypothetical problems
+- Observable IS pipedream's identity
+- Reliable changes the mental model fundamentally
+- Wait for real user need before committing to second mode
+
+**If added later, document clearly:**
+```markdown
+⚠️ Reliable mode is for specialized use cases only.
+Most users should use the default Observable mode.
+```
 
 ### 8. **Error Aggregation Option**
 
@@ -515,16 +653,37 @@ pipedream guarantees lossless delivery:
 
 After:
 ```markdown
-A typed, heterogeneous event relay library for Rust with observable broadcast delivery...
+A typed, heterogeneous event relay library for Rust with observable delivery...
 
-### Delivery Semantics
+### Observable Delivery
 
-pipedream uses broadcast semantics for high throughput:
-- Messages are delivered to all active subscribers via try_send
-- Slow consumers may miss messages if their buffer fills (default: 65536 messages)
-- Message drops are observable via Dropped events: `rx.subscribe::<Dropped>()`
+pipedream provides observable delivery semantics with configurable modes:
+
+**Observable Mode (default)** - High throughput with observable drops:
+- Messages delivered to all active subscribers via try_send
+- Slow consumers may miss messages if their buffer fills (default: 65536)
+- Drops are observable via Dropped events: `rx.subscribe::<Dropped>()`
 - No backpressure - senders never block waiting for slow consumers
-- Use `channel_with_size()` to tune buffer size for your workload
+- Ideal for: logging, metrics, monitoring, high-throughput event streams
+
+**Reliable Mode** - Lossless delivery with backpressure:
+- Messages delivered via send().await with blocking
+- Slow consumers apply backpressure to senders
+- No message drops, guaranteed delivery
+- Ideal for: event sourcing, state machines, reliable command buses
+
+Configure via builder:
+```rust
+// Observable (default)
+let (tx, rx) = Relay::builder()
+    .delivery_mode(DeliveryMode::Observable)
+    .build();
+
+// Reliable
+let (tx, rx) = Relay::builder()
+    .delivery_mode(DeliveryMode::Reliable)
+    .build();
+```
 ```
 
 **In Subscription.rs (lines 14-17):**
@@ -539,9 +698,10 @@ Before:
 After:
 ```rust
 /// ## Delivery Semantics
-/// Subscriptions receive messages via broadcast semantics with buffering.
-/// Slow consumers may miss messages if their buffer fills (see Dropped events).
-/// No backpressure - senders use try_send and never block.
+/// Supports two delivery modes configured via builder:
+/// - Observable: try_send with buffering (drops observable via Dropped events)
+/// - Reliable: send().await with backpressure (lossless delivery)
+/// See DeliveryMode for details on choosing the right mode.
 ```
 
 **In CLAUDE.md (line 9):**
@@ -553,7 +713,7 @@ Before:
 
 After:
 ```markdown
-- **Broadcast delivery** - if `send().await` returns Ok, message was sent (drops observable via Dropped events)
+- **Observable delivery** - configurable modes: Observable (high throughput, drops observable) or Reliable (lossless with backpressure)
 ```
 
 **Why:** The design-doc.md already correctly describes broadcast semantics. README.md should match that reality.
@@ -561,47 +721,114 @@ After:
 ### 19. **Anti-Patterns Documentation**
 
 **Common Mistakes:**
-1. Forgetting to call `complete_one()` in tracked handlers
-2. Not calling `clear_tracker()` (double-completion risk)
-3. Using `subscribe()` when `subscribe_tracked()` is needed
-4. Awaiting child relay sends inside parent handlers (deadlock risk?)
-5. Creating reference cycles with bidirectional forwards
-6. Not sizing channels for workload (drops or memory bloat)
 
-## Acceptance Criteria
+#### 1. **Circular Dependency / Forward-Only Violation (DEADLOCK)**
 
-### Critical (Must Fix)
+**Problem:** Tracked handlers that await `send()` on their parent relay create circular dependencies.
 
-- [ ] **Fix README.md lossless delivery claims** - Update lines 3, 281-289 to describe broadcast semantics accurately
-- [ ] **Fix Subscription.rs docs** - Update lines 14-17 to describe broadcast semantics accurately
-- [ ] **Update CLAUDE.md** - Change line 9 from "lossless" to "broadcast" delivery
-- [ ] Add panic catching to all forwarder task loops
-- [ ] Document or fix ready signal race condition
-- [ ] Expand SEMANTICS.md with complete tracking boundary documentation
+**Why it deadlocks:**
+- Handler must complete before `send().await` returns
+- But handler is waiting for its own `send()` to complete
+- Circular wait = deadlock
 
-### High Priority (Should Fix)
+**❌ WRONG:**
+```rust
+relay.sink::<Event, _, _>(|event| async move {
+    // DEADLOCK: Waiting for self to complete!
+    relay.send(DerivedEvent::from(event)).await?;
+    Ok(())
+});
+```
 
-- [ ] Add `.ready().await` barrier or make ready signals multi-consumer
-- [ ] Add `.wait_for_wiring()` for handler registration synchronization
-- [ ] Document WeakSender upgrade timing and close propagation sequence
-- [ ] Add builder pattern for relay configuration
-- [ ] Create comprehensive benchmark suite
+**✅ CORRECT - Use Child Relay:**
+```rust
+let child = relay.filter::<Event, _>(|_| true);
+relay.sink::<Event, _, _>(move |event| async move {
+    // OK: Different relay, no circular dependency
+    child.send(DerivedEvent::from(event)).await?;
+    Ok(())
+});
+```
 
-### Medium Priority (Nice to Have)
+**✅ CORRECT - Use WeakSender (Untracked):**
+```rust
+let weak_tx = tx.weak();
+relay.sink::<Event, _, _>(move |event| async move {
+    // OK: Untracked send, doesn't participate in completion
+    weak_tx.send(DerivedEvent::from(event)).await.ok();
+    Ok(())
+});
+```
 
-- [ ] Add error aggregation option for debugging
-- [ ] Implement property-based tests for invariants
-- [ ] Add memory leak detection tests
-- [ ] Create visual flow diagrams (Mermaid)
-- [ ] Write migration guide for deprecated APIs
-- [ ] Document anti-patterns with examples
+**Rule:** **Tracked handlers must only send forward (downstream), never upstream or to self.**
 
-### Low Priority (Future)
+#### 2. **Forgetting to call `complete_one()` in tracked handlers**
 
-- [ ] Explore type-indexed channel partitioning
-- [ ] Consider zero-copy optimization for single-subscriber
-- [ ] Add type-safe batching with const generics
-- [ ] Performance tuning guide with benchmarks
+Handler never completes, `send().await` hangs forever.
+
+#### 3. **Not calling `clear_tracker()` after completion (double-completion risk)**
+
+Tracker can be completed twice if not cleared.
+
+#### 4. **Using `subscribe()` when `subscribe_tracked()` is needed**
+
+Fire-and-forget semantics when you need completion tracking.
+
+#### 5. **Creating reference cycles with bidirectional forwards**
+
+```rust
+relay1.forward(&relay2);
+relay2.forward(&relay1);  // Cycle! Use origin field to detect/prevent
+```
+
+#### 6. **Not sizing channels for workload in Observable mode**
+
+- Too small: excessive drops
+- Too large: memory bloat
+
+Use monitoring (`Dropped` events) to tune buffer size.
+
+## Acceptance Criteria by Tier
+
+### Tier 0: Define Identity (Do Immediately)
+
+**Semantic Contract Fixes:**
+- [ ] **Fix README.md** - Lines 3, 281-289: Change "lossless" to "Observable Delivery"
+- [ ] **Fix Subscription.rs** - Lines 14-17: Remove "no message dropping" claims
+- [ ] **Update CLAUDE.md** - Line 9: Describe Observable Delivery
+- [ ] **Add "What Pipedream Is NOT"** - Prevent misuse and support burden
+
+**Correctness Fixes:**
+- [ ] **Fix ready signal races** - Change `notify_one` to `notify_waiters` (one-line fix)
+- [ ] **Add forwarder panic supervision** - Catch panics, emit `RelayError::HandlerPanic`, close child
+
+**Result:** Clear identity, honest contracts, no semantic debt.
+
+### Tier 1: Documentation & Guidance (Before 1.0)
+
+- [ ] **Expand SEMANTICS.md** - Complete tracking boundary table, circular dependency warnings
+- [ ] **Add Anti-patterns section** - Forward-Only rule with deadlock examples
+- [ ] **Migration guide** - Legacy API → Channel API
+- [ ] **Document WeakSender timing** - Close propagation sequence
+
+**Result:** Users can't shoot themselves in the foot.
+
+### Tier 2: Advanced Features (ONLY After Real Users)
+
+- [ ] **Consider Reliable mode** - If users prove they need lossless delivery
+- [ ] **Benchmark suite** - Compare Observable vs Reliable (if implemented)
+- [ ] **Performance tuning guide** - Buffer sizing, allocation patterns
+- [ ] **Property-based tests** - If complexity increases
+
+**Result:** Solve actual problems, not hypothetical ones.
+
+### Explicitly Deferred (Don't Do)
+
+- [ ] ~~`.wait_for_wiring()` for handler registration~~ - Don't over-promise synchronization
+- [ ] ~~Error aggregation~~ - First error wins is fine
+- [ ] ~~Type-indexed partitioning~~ - Premature optimization
+- [ ] ~~Zero-copy optimization~~ - Solve after measuring
+- [ ] ~~Type-safe batching with const generics~~ - Adds rigidity, little benefit
 
 ## Success Metrics
 
@@ -626,51 +853,185 @@ After:
 - ✅ Memory usage scales linearly with load
 - ✅ No unexpected contention bottlenecks
 
-## Implementation Phases
+## Implementation Details (Tier 0)
 
-### Phase 1: Critical Fixes (Required for 1.0)
+### Supervisor Pattern for Forwarders (High Priority)
+
+**Example for map() transformation:**
+
+```rust
+// In map() forwarder task
+let forwarder = tokio::spawn(async move {
+    // Signal ready
+    drop(ready_guard);
+
+    loop {
+        match parent_sub.recv().await {
+            Some(msg) => {
+                // Catch panics in transformation
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    transform_fn(&msg)
+                }));
+
+                match result {
+                    Ok(transformed) => {
+                        // Forward successfully
+                        if let Err(_) = child_tx.send(transformed).await {
+                            break; // Child closed
+                        }
+                    }
+                    Err(panic_payload) => {
+                        // Create panic error
+                        let panic_error = PanicError::new(panic_payload);
+                        let relay_error = RelayError {
+                            msg_id: msg.msg_id(),
+                            source: "map forwarder",
+                            error: Arc::new(panic_error),
+                        };
+
+                        // Emit error to parent (observable)
+                        let _ = parent_relay.emit_untracked(relay_error).await;
+
+                        // Close child and exit
+                        child_relay.close();
+                        break;
+                    }
+                }
+            }
+            None => {
+                // Parent closed
+                child_relay.close();
+                break;
+            }
+        }
+    }
+});
+```
+
+**Apply to all transformations:**
+- `filter()` - catch panics in predicate
+- `filter_map()` - catch panics in transform
+- `batch()` - catch panics in batching logic
+- `map()` - catch panics in map function
+
+### Ready Signal Barrier Fix
+
+**Current (src/tracker.rs or wherever ReadyGuard lives):**
+```rust
+impl Drop for ReadyGuard {
+    fn drop(&mut self) {
+        // ... decrement pending_ready ...
+        self.relay.ready_notify.notify_one();  // Single consumer!
+    }
+}
+```
+
+**Fixed:**
+```rust
+impl Drop for ReadyGuard {
+    fn drop(&mut self) {
+        // ... decrement pending_ready ...
+        self.relay.ready_notify.notify_waiters();  // Multi-consumer barrier!
+    }
+}
+```
+
+**Impact:** All concurrent sends now wait for wiring, not just the first one.
+
+## Implementation Phases (Tiered)
+
+### Tier 0: Define Identity (Do Immediately - Days)
+
+**Goal:** Clear semantic contracts, no lies.
 
 **Tasks:**
-1. **Fix documentation to match implementation:**
-   - Update README.md lines 3, 281-289 (remove "lossless" claims, describe broadcast semantics)
-   - Update Subscription.rs lines 14-17 (remove "no message dropping" claims)
-   - Update CLAUDE.md line 9 (change "lossless" to "broadcast")
-   - Align all docs with design-doc.md's honest description
-2. Add panic catching to forwarder tasks
-3. Fix or document ready signal races
-4. Expand tracking boundary documentation in SEMANTICS.md
+1. **Fix documentation (30 min):**
+   - README.md lines 3, 281-289 → "Observable Delivery"
+   - Subscription.rs lines 14-17 → Remove "no dropping" claims
+   - CLAUDE.md line 9 → Describe Observable Delivery
+   - Add "What Pipedream IS NOT" section to README
 
-**Estimated Effort:** Low to Medium complexity - mostly documentation changes, design-doc.md already has correct description
+2. **Fix ready signals (5 min):**
+   - Change `notify_one()` to `notify_waiters()` in ReadyGuard::drop
+   - One-line fix, major correctness improvement
 
-### Phase 2: API Improvements (Ergonomics)
+3. **Add forwarder panic supervision (2-3 hours):**
+   - Wrap transformation closures in `catch_unwind`
+   - Emit `RelayError::HandlerPanic` on panic
+   - Close child relay and exit forwarder cleanly
+   - Update: `map()`, `filter()`, `filter_map()`, `batch()`
+   - Add tests for panic scenarios
 
-**Tasks:**
-1. Add builder pattern for configuration
-2. Implement `.ready()` and `.wait_for_wiring()` barriers
-3. Add error aggregation option
-4. Document WeakSender timing
+**Estimated Effort:** 1 day
 
-**Estimated Effort:** Medium complexity - mostly additive changes
+**Result:** Honest library with clear identity.
 
-### Phase 3: Testing & Performance (Validation)
+### Tier 1: Documentation & Guidance (Before 1.0 - Weeks)
 
-**Tasks:**
-1. Add property-based tests
-2. Create benchmark suite
-3. Memory leak detection tests
-4. Performance comparison vs. alternatives
-
-**Estimated Effort:** Medium complexity - infrastructure setup
-
-### Phase 4: Documentation (Polish)
+**Goal:** Users can't misuse pipedream.
 
 **Tasks:**
-1. Visual flow diagrams
-2. Migration guide
-3. Performance tuning guide
-4. Anti-patterns documentation
+1. **Expand SEMANTICS.md:**
+   - Complete tracking boundary table (all transformations)
+   - Add circular dependency section with Forward-Only rule
+   - Document panic handling in forwarders
 
-**Estimated Effort:** Low complexity - documentation work
+2. **Anti-patterns documentation:**
+   - Add to README with Forward-Only rule
+   - Deadlock examples with correct patterns
+   - Common mistakes and fixes
+
+3. **Migration guide:**
+   - Legacy API → Channel API
+   - Code examples for each pattern
+
+4. **WeakSender timing docs:**
+   - Close propagation sequence
+   - Upgrade failure scenarios
+
+**Estimated Effort:** 1-2 weeks
+
+**Result:** Clear guardrails, hard to misuse.
+
+### Tier 2: Advanced Features (ONLY After Real Users - Months)
+
+**Goal:** Solve actual problems, not hypothetical ones.
+
+**Tasks (conditional on real user need):**
+1. **Consider Reliable mode (if requested):**
+   - Add `DeliveryMode` enum
+   - Implement builder pattern
+   - `send().await` blocking in Reliable mode
+   - Document as advanced/opt-in with warnings
+
+2. **Benchmark suite (if performance questions arise):**
+   - Throughput, latency, memory
+   - Compare Observable vs alternatives
+   - Compare Observable vs Reliable (if implemented)
+
+3. **Performance tuning guide (if needed):**
+   - Buffer sizing recommendations
+   - Allocation patterns
+   - Monitoring with `Dropped` events
+
+4. **Property-based tests (if complexity increases):**
+   - Completion tracking invariants
+   - Error propagation consistency
+
+**Estimated Effort:** Ongoing
+
+**Result:** Solve real problems as they emerge.
+
+### Explicitly NOT Doing
+
+**Won't implement (premature):**
+- ❌ `.wait_for_wiring()` - Over-promises synchronization
+- ❌ Error aggregation - First error wins is sufficient
+- ❌ Type-indexed partitioning - Solve after measuring
+- ❌ Zero-copy optimization - Optimize after profiling
+- ❌ Const generic batching - Adds rigidity
+
+**Discipline:** Don't drift into actor-framework territory.
 
 ## Technical Considerations
 

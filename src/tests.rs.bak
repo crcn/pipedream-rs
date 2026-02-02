@@ -59,6 +59,10 @@ async fn test_type_filtering() {
     assert_eq!(int_msg.as_deref(), Some(&42i32));
 }
 
+
+
+
+
 #[tokio::test]
 async fn test_broadcast_multiple_subscribers() {
     let stream = Relay::new();
@@ -78,6 +82,48 @@ async fn test_broadcast_multiple_subscribers() {
     assert_eq!(msg2.as_deref(), Some(&"hello".to_string()));
 }
 
+#[tokio::test]
+async fn test_cascade_close() {
+    let stream = Relay::new();
+    let filtered = stream.filter::<String, _>(|_| true);
+    let mut sub = filtered.subscribe::<String>();
+
+    stream.send("hello".to_string()).await.unwrap();
+
+    let msg = tokio::time::timeout(Duration::from_millis(100), sub.recv())
+        .await
+        .unwrap();
+    assert_eq!(msg.as_deref(), Some(&"hello".to_string()));
+
+    // Drop root stream
+    drop(stream);
+
+    // Subscription should close
+    let closed = tokio::time::timeout(Duration::from_millis(100), sub.recv())
+        .await
+        .unwrap();
+    assert_eq!(closed, None);
+}
+
+
+
+
+
+#[tokio::test]
+async fn test_send_to_closed_stream() {
+    let stream = Relay::new();
+    let derived = stream.filter::<String, _>(|_| true);
+
+    drop(stream);
+
+    // Small delay to let forwarder detect closure
+    tokio::task::yield_now().await;
+
+    // Send to derived stream after parent closed
+    let result = derived.send("should fail".to_string()).await;
+    assert_eq!(result, Err(SendError::Closed));
+}
+
 
 
 #[tokio::test]
@@ -86,7 +132,7 @@ async fn test_tap() {
     let counter_clone = counter.clone();
 
     let stream = Relay::new();
-    stream.tap::<i32, _, _>(move |n| {
+    let _tapped = stream.clone().tap::<i32, _, _>(move |n| {
         counter_clone.fetch_add(*n as usize, Ordering::SeqCst);
     });
 
@@ -120,11 +166,156 @@ async fn test_sink() {
     assert_eq!(counter.load(Ordering::SeqCst), 20);
 }
 
+
+#[ignore]
+
+#[ignore]
+
+
 // ==================== STRESS TESTS ====================
 
+#[tokio::test]
+async fn stress_test_rapid_send_no_race() {
+    // Verify no messages are dropped when sending rapidly after filter setup
+    // Use larger buffer to hold all messages (broadcast channels are lossy for slow receivers)
+    let stream = Relay::with_channel_size(1024);
+    let filtered = stream.filter::<i32, _>(|x| *x % 2 == 0);
+    let mut sub = filtered.subscribe::<i32>();
 
+    const COUNT: i32 = 1000;
 
+    // Send rapidly without any sleeps
+    for i in 0..COUNT {
+        stream.send(i).await.unwrap();
+    }
 
+    // Should receive exactly half (all even numbers)
+    let mut received = Vec::new();
+    for _ in 0..(COUNT / 2) {
+        let msg = tokio::time::timeout(Duration::from_secs(1), sub.recv())
+            .await
+            .expect("timeout waiting for message")
+            .expect("stream closed unexpectedly");
+        received.push(*msg);
+    }
+
+    assert_eq!(received.len(), (COUNT / 2) as usize);
+    for (i, val) in received.iter().enumerate() {
+        assert_eq!(*val, (i * 2) as i32, "expected even number at index {}", i);
+    }
+}
+
+#[tokio::test]
+async fn stress_test_deep_filter_chain() {
+    // Test deeply nested filter chain
+    // Use larger buffer because each filter stage has its own channel
+    let stream = Relay::with_channel_size(256);
+
+    let filtered = stream
+        .filter::<i32, _>(|x| *x > 0)
+        .filter::<i32, _>(|x| *x > 10)
+        .filter::<i32, _>(|x| *x > 20)
+        .filter::<i32, _>(|x| *x > 30)
+        .filter::<i32, _>(|x| *x < 100);
+
+    let mut sub = filtered.subscribe::<i32>();
+
+    // Send values, only 31-99 should pass all filters
+    for i in 0..150 {
+        stream.send(i).await.unwrap();
+    }
+
+    let mut received = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_millis(100), sub.recv()).await {
+            Ok(Some(msg)) => received.push(*msg),
+            _ => break,
+        }
+    }
+
+    let expected: Vec<i32> = (31..100).collect();
+    assert_eq!(received, expected);
+}
+
+#[tokio::test]
+async fn stress_test_many_subscribers() {
+    // Test many concurrent subscribers
+    // Use larger buffer to handle all messages
+    let stream = Relay::with_channel_size(128);
+    let filtered = stream.filter::<i32, _>(|_| true);
+
+    const NUM_SUBSCRIBERS: usize = 50;
+    const NUM_MESSAGES: i32 = 100;
+
+    let mut subs: Vec<_> = (0..NUM_SUBSCRIBERS)
+        .map(|_| filtered.subscribe::<i32>())
+        .collect();
+
+    for i in 0..NUM_MESSAGES {
+        stream.send(i).await.unwrap();
+    }
+
+    // Each subscriber should receive all messages
+    for (idx, sub) in subs.iter_mut().enumerate() {
+        let mut count = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_millis(100), sub.recv()).await {
+                Ok(Some(_)) => count += 1,
+                _ => break,
+            }
+        }
+        assert_eq!(
+            count, NUM_MESSAGES as usize,
+            "subscriber {} received {} messages, expected {}",
+            idx, count, NUM_MESSAGES
+        );
+    }
+}
+
+#[tokio::test]
+async fn stress_test_dropped_subscriber_mid_stream() {
+    // Test that dropping a subscriber doesn't affect others
+    let stream = Relay::new();
+    let filtered = stream.filter::<i32, _>(|_| true);
+
+    let mut sub1 = filtered.subscribe::<i32>();
+    let mut sub2 = filtered.subscribe::<i32>();
+    let sub3_to_drop = filtered.subscribe::<i32>();
+
+    // Send some messages
+    for i in 0..10 {
+        stream.send(i).await.unwrap();
+    }
+
+    // Drop one subscriber mid-stream
+    drop(sub3_to_drop);
+
+    // Send more messages
+    for i in 10..20 {
+        stream.send(i).await.unwrap();
+    }
+
+    // Remaining subscribers should get all 20 messages
+    let mut count1 = 0;
+    let mut count2 = 0;
+
+    loop {
+        match tokio::time::timeout(Duration::from_millis(100), sub1.recv()).await {
+            Ok(Some(_)) => count1 += 1,
+            _ => break,
+        }
+    }
+
+    loop {
+        match tokio::time::timeout(Duration::from_millis(100), sub2.recv()).await {
+            Ok(Some(_)) => count2 += 1,
+            _ => break,
+        }
+    }
+
+    assert_eq!(count1, 20);
+    assert_eq!(count2, 20);
+}
 
 #[tokio::test]
 async fn stress_test_concurrent_senders() {
@@ -167,9 +358,151 @@ async fn stress_test_concurrent_senders() {
     assert_eq!(count, SENDERS * MESSAGES_PER_SENDER);
 }
 
+#[tokio::test]
+async fn stress_test_fan_in_fan_out() {
+    // Multiple sources piping to one target, then fanning out to multiple subscribers
+    // Use larger buffer to handle all messages
+    let sources: Vec<_> = (0..5).map(|_| Relay::with_channel_size(128)).collect();
+    let target = Relay::with_channel_size(128);
 
+    // Spawn forward tasks (forward blocks until source closes)
+    for source in &sources {
+        let source = source.clone();
+        let target = target.clone();
+        tokio::spawn(async move { source.forward(&target).await });
+    }
 
+    // Give forward tasks time to set up
+    tokio::time::sleep(Duration::from_millis(10)).await;
 
+    let mut subs: Vec<_> = (0..5).map(|_| target.subscribe::<i32>()).collect();
+
+    // Each source sends 20 messages
+    for (src_idx, source) in sources.iter().enumerate() {
+        for i in 0..20 {
+            source.send((src_idx * 100 + i) as i32).await.unwrap();
+        }
+    }
+
+    // Each subscriber should receive 100 messages (5 sources * 20 messages)
+    for (idx, sub) in subs.iter_mut().enumerate() {
+        let mut count = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_millis(100), sub.recv()).await {
+                Ok(Some(_)) => count += 1,
+                _ => break,
+            }
+        }
+        assert_eq!(count, 100, "subscriber {} received {} messages", idx, count);
+    }
+}
+
+#[tokio::test]
+async fn stress_test_rapid_filter_create_and_send() {
+    // Rapidly create filters and send - tests that ready signals work correctly
+    let stream = Relay::new();
+
+    for iteration in 0..100 {
+        let filtered = stream.filter::<i32, _>(move |x| *x == iteration);
+        let mut sub = filtered.subscribe::<i32>();
+
+        // Send immediately after filter creation
+        stream.send(iteration).await.unwrap();
+        stream.send(iteration + 1000).await.unwrap(); // This one shouldn't match
+
+        let msg = tokio::time::timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timeout")
+            .expect("no message");
+
+        assert_eq!(*msg, iteration);
+    }
+}
+
+#[tokio::test]
+async fn stress_test_split_under_load() {
+    // Test filter with heavy load - split by value (even/odd)
+    // Note: split::<T>() splits by TYPE, not by value. Use filter for value-based splitting.
+    // Use larger buffer to handle all messages
+    let stream = Relay::with_channel_size(512);
+
+    // Filter to separate even/odd by value
+    let evens_filtered = stream.filter::<i32, _>(|x| *x % 2 == 0);
+    let odds_filtered = stream.filter::<i32, _>(|x| *x % 2 != 0);
+
+    let mut even_sub = evens_filtered.subscribe::<i32>();
+    let mut odd_sub = odds_filtered.subscribe::<i32>();
+
+    const COUNT: i32 = 500;
+
+    for i in 0..COUNT {
+        stream.send(i).await.unwrap();
+    }
+
+    let mut even_count = 0;
+    let mut odd_count = 0;
+
+    loop {
+        match tokio::time::timeout(Duration::from_millis(100), even_sub.recv()).await {
+            Ok(Some(msg)) => {
+                assert_eq!(*msg % 2, 0, "expected even, got {}", *msg);
+                even_count += 1;
+            }
+            _ => break,
+        }
+    }
+
+    loop {
+        match tokio::time::timeout(Duration::from_millis(100), odd_sub.recv()).await {
+            Ok(Some(msg)) => {
+                assert_eq!(*msg % 2, 1, "expected odd, got {}", *msg);
+                odd_count += 1;
+            }
+            _ => break,
+        }
+    }
+
+    assert_eq!(even_count, (COUNT / 2) as usize);
+    assert_eq!(odd_count, (COUNT / 2) as usize);
+}
+
+#[tokio::test]
+async fn stress_test_interleaved_subscribe_send() {
+    // Interleave subscribes and sends
+    // Use larger buffer to handle messages
+    let stream = Relay::with_channel_size(64);
+    let filtered = stream.filter::<i32, _>(|_| true);
+
+    let mut all_subs = Vec::new();
+
+    for i in 0..50 {
+        // Subscribe
+        all_subs.push(filtered.subscribe::<i32>());
+
+        // Send
+        stream.send(i).await.unwrap();
+        // Yield to let forwarder process the message before next subscribe
+        tokio::task::yield_now().await;
+    }
+
+    // First subscriber should have received all 50 messages
+    // Last subscriber should have received only 1 message (the last one)
+    for (idx, sub) in all_subs.iter_mut().enumerate() {
+        let mut count = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_millis(50), sub.recv()).await {
+                Ok(Some(_)) => count += 1,
+                _ => break,
+            }
+        }
+        let expected = 50 - idx;
+        assert_eq!(
+            count, expected,
+            "subscriber {} received {} messages, expected {}",
+            idx, count, expected
+        );
+    }
+}
 
 // ==================== ERROR HANDLING TESTS ====================
 
@@ -249,7 +582,7 @@ async fn test_error_subscription() {
     // Send error-triggering message
     let _ = stream.send("error".to_string()).await;
 
-    // Should receive the error as a message (emitted asynchronously)
+    // Should receive the error as a message
     let error = tokio::time::timeout(Duration::from_millis(100), error_sub.recv())
         .await
         .unwrap();
@@ -709,7 +1042,78 @@ async fn stress_test_mixed_success_and_error_types() {
     );
 }
 
+#[tokio::test]
+async fn stress_test_concurrent_close_propagation() {
+    // Test that dropping parent closes all derived streams correctly
+    // even when there are many of them
+    for _ in 0..10 {
+        let stream = Relay::new();
+        let mut subs = Vec::new();
 
+        // Create many derived streams and their subscriptions
+        for _ in 0..20 {
+            let derived = stream.filter::<String, _>(|_| true);
+            let sub = derived.subscribe::<String>();
+            subs.push((derived, sub));
+        }
+
+        // Send a message to ensure forwarders are active
+        stream.send("test".to_string()).await.unwrap();
+
+        // Receive the message from all subscriptions first
+        for (_derived, sub) in &mut subs {
+            let msg = tokio::time::timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .expect("should receive message")
+                .expect("message should exist");
+            assert_eq!(&*msg, "test");
+        }
+
+        // Drop parent
+        drop(stream);
+
+        // All subscriptions should close (return None on next recv)
+        for (_derived, mut sub) in subs {
+            let result = tokio::time::timeout(Duration::from_millis(500), sub.recv())
+                .await
+                .expect("should not timeout");
+            assert!(
+                result.is_none(),
+                "subscription should close when parent dropped"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn stress_test_race_drop_and_send() {
+    // Test race between drop and send - should not hang or panic
+    for _ in 0..50 {
+        let stream = Relay::new();
+        let derived = stream.filter::<i32, _>(|_| true);
+        let stream_clone = stream.clone();
+
+        // Spawn sender
+        let sender = tokio::spawn(async move {
+            for i in 0..10 {
+                let _ = stream_clone.send(i).await;
+            }
+        });
+
+        // Race: drop parent while sending
+        tokio::task::yield_now().await;
+        drop(stream);
+
+        // Sender should complete (may get Closed errors)
+        let _ = tokio::time::timeout(Duration::from_millis(500), sender)
+            .await
+            .expect("sender should not hang");
+
+        // Derived should be closed
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(derived.is_closed());
+    }
+}
 
 #[tokio::test]
 async fn stress_test_rapid_subscribe_unsubscribe() {
@@ -759,6 +1163,34 @@ async fn test_multiple_errors_first_wins() {
     }
 }
 
+#[tokio::test]
+async fn test_operations_on_closed_stream() {
+    let stream = Relay::new();
+    let derived = stream.filter::<String, _>(|_| true);
+
+    // Drop the root - this should propagate closure
+    drop(stream);
+
+    // Wait for closure to propagate through the forwarder
+    // The forwarder task needs to run and detect parent closure
+    // Use a longer timeout via recv() instead of is_closed() which may race
+    let mut sub = derived.subscribe::<String>();
+    let closed_result = tokio::time::timeout(Duration::from_millis(500), sub.recv())
+        .await
+        .expect("forwarder should close child within 500ms");
+    assert!(closed_result.is_none(), "should receive None when closed");
+
+    // Now derived should definitely be closed
+    assert!(derived.is_closed());
+
+    // Send on closed derived stream
+    let result = derived.send("test".to_string()).await;
+    assert_eq!(result, Err(SendError::Closed));
+
+    // Filter on closed stream returns closed stream
+    let filtered = derived.filter::<String, _>(|_| true);
+    assert!(filtered.is_closed());
+}
 
 #[tokio::test]
 async fn test_tracker_zero_expected() {
@@ -875,6 +1307,27 @@ async fn test_subscription_drop_mid_message() {
     assert_eq!(processed.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn test_chained_maps() {
+    let stream = Relay::new();
+
+    // Chain of maps: i32 -> double -> square -> string
+    let result = stream
+        .map::<i32, i32, _>(|n| n * 2)
+        .map::<i32, i32, _>(|n| n * n)
+        .map::<i32, String, _>(|n| format!("result: {}", n));
+
+    let mut sub = result.subscribe::<String>();
+
+    stream.send(3i32).await.unwrap(); // 3 -> 6 -> 36 -> "result: 36"
+
+    let msg = tokio::time::timeout(Duration::from_millis(100), sub.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(&*msg, "result: 36");
+}
 
 #[tokio::test]
 async fn test_error_does_not_block_subsequent_sends() {
@@ -957,6 +1410,8 @@ async fn test_rapid_handler_registration_deregistration() {
     assert_eq!(total.load(Ordering::SeqCst), 10);
 }
 
+#[ignore]
+
 // ============================================================================
 // Tests for new convenience methods
 // ============================================================================
@@ -983,6 +1438,113 @@ async fn test_handler_count() {
     assert_eq!(stream.handler_count(), 2);
 }
 
+#[ignore]
+
+#[ignore]
+
+#[ignore]
+#[tokio::test]
+async fn test_batch_basic() {
+    let stream = Relay::new();
+
+    // Batch integers into groups of 3
+    let batched = stream.batch::<i32>(3);
+    let mut sub = batched.subscribe::<Vec<i32>>();
+
+    // Send 5 items
+    for i in 1..=5 {
+        stream.send(i).await.unwrap();
+    }
+
+    // First batch should be [1, 2, 3]
+    let batch1 = tokio::time::timeout(Duration::from_millis(100), sub.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*batch1, &vec![1, 2, 3]);
+
+    // Drop stream to flush remaining
+    drop(stream);
+
+    // Second batch should be [4, 5]
+    let batch2 = tokio::time::timeout(Duration::from_millis(100), sub.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*batch2, &vec![4, 5]);
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_batch_exact_multiple() {
+    let stream = Relay::new();
+
+    // Batch into groups of 2
+    let batched = stream.batch::<i32>(2);
+    let mut sub = batched.subscribe::<Vec<i32>>();
+
+    // Send exactly 4 items (2 full batches)
+    for i in 1..=4 {
+        stream.send(i).await.unwrap();
+    }
+
+    let batch1 = tokio::time::timeout(Duration::from_millis(100), sub.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*batch1, &vec![1, 2]);
+
+    let batch2 = tokio::time::timeout(Duration::from_millis(100), sub.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*batch2, &vec![3, 4]);
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_batch_with_sink() {
+    let stream = Relay::new();
+    let batches_received = Arc::new(AtomicUsize::new(0));
+    let br = batches_received.clone();
+
+    let batched = stream.batch::<String>(2);
+
+    // Use tap instead of sink - tap returns self for chaining
+    // and the batched stream doesn't need to track completion
+    let mut sub = batched.subscribe::<Vec<String>>();
+
+    // Spawn receiver
+    let handle = tokio::spawn(async move {
+        while let Some(batch) = sub.recv().await {
+            assert!(batch.len() <= 2);
+            br.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    // Send 4 items (exactly 2 full batches)
+    stream.send("a".to_string()).await.unwrap();
+    stream.send("b".to_string()).await.unwrap();
+    stream.send("c".to_string()).await.unwrap();
+    stream.send("d".to_string()).await.unwrap();
+
+    // Close stream to flush any remaining and stop receiver
+    drop(stream);
+
+    // Wait for receiver to finish
+    let _ = tokio::time::timeout(Duration::from_millis(500), handle).await;
+
+    // Should have received 2 batches
+    assert_eq!(batches_received.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+#[should_panic(expected = "batch size must be > 0")]
+async fn test_batch_zero_size_panics() {
+    let stream = Relay::new();
+    let _ = stream.batch::<i32>(0);
+}
+
 // ============================================================================
 // NEW API TESTS: Stream, Duplex, Readable, Writable, Pipe
 // ============================================================================
@@ -999,6 +1561,8 @@ async fn test_stream_basic_send_subscribe() {
         .unwrap();
     assert_eq!(msg.as_deref(), Some(&"hello".to_string()));
 }
+
+
 
 #[tokio::test]
 async fn test_channel_no_echo() {
@@ -1021,6 +1585,7 @@ async fn test_channel_no_echo() {
 
 */
 
+
 /* REMOVED: Duplex API no longer exists
 #[tokio::test]
 async fn test_duplex_close() {
@@ -1033,6 +1598,7 @@ async fn test_duplex_close() {
 }
 
 */
+
 
 #[tokio::test]
 async fn test_stream_is_loopback() {
@@ -1179,7 +1745,82 @@ async fn invariant_error_emitted_exactly_once() {
 
 // ==================== I3: Echo Prevention ====================
 
+#[tokio::test]
+async fn invariant_echo_prevention_bidirectional_pipe() {
+    // I3: Bidirectional piping must not cause feedback loops
+    let a = Relay::new();
+    let b = Relay::new();
 
+    let a2 = a.clone();
+    let b2 = b.clone();
+    tokio::spawn(async move {
+        a2.forward(&b2).await;
+    });
+    let b3 = b.clone();
+    let a3 = a.clone();
+    tokio::spawn(async move {
+        b3.forward(&a3).await;
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let c = count.clone();
+
+    a.sink::<i32, _, _>(move |_| {
+        c.fetch_add(1, Ordering::SeqCst);
+    });
+
+    a.send(1i32).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "message must be received exactly once, not echoed"
+    );
+}
+
+#[tokio::test]
+async fn invariant_echo_prevention_triangle() {
+    // I3: Echo prevention in a triangle topology
+    let a = Relay::new();
+    let b = Relay::new();
+    let c = Relay::new();
+
+    let a2 = a.clone();
+    let b2 = b.clone();
+    tokio::spawn(async move {
+        a2.forward(&b2).await;
+    });
+    let b3 = b.clone();
+    let c2 = c.clone();
+    tokio::spawn(async move {
+        b3.forward(&c2).await;
+    });
+    let c3 = c.clone();
+    let a3 = a.clone();
+    tokio::spawn(async move {
+        c3.forward(&a3).await;
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let cnt = count.clone();
+
+    a.sink::<i32, _, _>(move |_| {
+        cnt.fetch_add(1, Ordering::SeqCst);
+    });
+
+    a.send(1i32).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Message originates from a, goes to b, then c, but should NOT come back to a
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "message must not loop back"
+    );
+}
 
 // ==================== I4: No Silent Deadlock ====================
 
@@ -1225,6 +1866,25 @@ async fn invariant_handler_count_restored_after_panic() {
     );
 }
 
+#[tokio::test]
+async fn invariant_no_deadlock_filter_setup() {
+    // I4: Filter setup must not cause deadlock even under concurrent sends
+    let relay = Relay::new();
+
+    // Setup filter and immediately try to send
+    let filtered = relay.filter::<i32, _>(|v| *v > 0);
+    let mut sub = filtered.subscribe::<i32>();
+
+    let result = tokio::time::timeout(Duration::from_millis(100), relay.send(42i32)).await;
+
+    assert!(
+        result.is_ok(),
+        "send() must not deadlock during filter setup"
+    );
+
+    let msg = tokio::time::timeout(Duration::from_millis(100), sub.recv()).await;
+    assert!(msg.is_ok(), "message should arrive");
+}
 
 // ==================== I5: Closure Monotonicity ====================
 
@@ -1238,6 +1898,19 @@ async fn invariant_closed_relay_rejects_sends() {
     assert!(matches!(result, Err(SendError::Closed)));
 }
 
+#[tokio::test]
+async fn invariant_closure_propagates_to_derived() {
+    // I5: Closing parent must eventually close all derived relays
+    let relay = Relay::new();
+    let filtered = relay.filter::<i32, _>(|_| true);
+    let mapped = filtered.map::<i32, i32, _>(|v| *v * 2);
+
+    relay.close();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(filtered.is_closed(), "filtered must be closed");
+    assert!(mapped.is_closed(), "mapped must be closed");
+}
 
 #[tokio::test]
 async fn invariant_subscriptions_close_on_relay_close() {
@@ -1259,9 +1932,55 @@ async fn invariant_subscriptions_close_on_relay_close() {
 
 // ==================== Soak/Fuzz Test ====================
 
+#[tokio::test]
+async fn soak_random_pipeline_no_deadlock() {
+    // Stress test: random pipeline operations should not deadlock
+    let relay = Relay::with_channel_size(256);
+
+    // Spawn many concurrent pipeline builders
+    let handles: Vec<_> = (0..20)
+        .map(|i| {
+            let r = relay.clone();
+            tokio::spawn(async move {
+                let filtered = r.filter::<i32, _>(move |v| v % 2 == i % 2);
+                let mapped = filtered.map::<i32, i32, _>(|v| v + 1);
+                mapped.sink::<i32, _, _>(|_| {});
+            })
+        })
+        .collect();
+
+    // Wait for pipelines to be set up
+    for h in handles {
+        let _ = h.await;
+    }
+
+    // Send many messages
+    for i in 0..100 {
+        let result = tokio::time::timeout(Duration::from_millis(100), relay.send(i)).await;
+
+        assert!(result.is_ok(), "send {} must not deadlock", i);
+    }
+}
 
 // ==================== Regression Tests (fixes we implemented) ====================
 
+#[tokio::test]
+async fn regression_ready_guard_signals_on_drop() {
+    // Tests that ReadyGuard signals readiness even if forwarder task is cancelled
+    // This would have caused deadlocks before the fix
+    let relay = Relay::new();
+
+    // Create filter which uses ReadyGuard internally
+    let _filtered = relay.filter::<i32, _>(|_| true);
+
+    // If ReadyGuard doesn't signal on drop, this would deadlock
+    let result = tokio::time::timeout(Duration::from_millis(100), relay.send(1i32)).await;
+
+    assert!(
+        result.is_ok(),
+        "send must not deadlock - ReadyGuard should signal on drop"
+    );
+}
 
 #[tokio::test]
 async fn regression_handler_guard_decrements_on_panic() {
@@ -1291,7 +2010,56 @@ async fn regression_handler_guard_decrements_on_panic() {
     );
 }
 
+#[tokio::test]
+async fn regression_ready_signals_use_notify_not_oneshot() {
+    // Tests that ready signal mechanism uses notify_one (stores permit) not notify_waiters
+    // This would have caused race conditions before the fix
+    let relay = Relay::new();
 
+    // Rapidly create many filters and send
+    for i in 0..50 {
+        let _filtered = relay.filter::<i32, _>(move |v| *v == i);
+
+        let result = tokio::time::timeout(Duration::from_millis(100), relay.send(i)).await;
+
+        assert!(
+            result.is_ok(),
+            "send {} must not deadlock with rapid filter creation",
+            i
+        );
+    }
+}
+
+#[tokio::test]
+async fn regression_ready_guard_releases_arc() {
+    // Tests that ReadyGuard releases Arc<Inner> after signaling
+    // This ensures parent stream can be properly cleaned up
+    let relay = Relay::new();
+    let filtered = relay.filter::<String, _>(|_| true);
+    let mut sub = filtered.subscribe::<String>();
+
+    // Send a message to ensure forwarder is running
+    relay.send("test".to_string()).await.unwrap();
+
+    // Receive the message
+    let _ = sub.recv().await;
+
+    // Drop parent - should propagate closure to child
+    drop(relay);
+
+    // Child should close within a reasonable time
+    // (This would hang if ReadyGuard held Arc<Inner>)
+    let result = tokio::time::timeout(Duration::from_millis(500), sub.recv()).await;
+
+    assert!(
+        result.is_ok(),
+        "closure should propagate - ReadyGuard must release Arc"
+    );
+    assert!(
+        result.unwrap().is_none(),
+        "subscription should return None on closure"
+    );
+}
 
 #[tokio::test]
 async fn soak_concurrent_subscribe_unsubscribe() {
@@ -1329,6 +2097,8 @@ async fn soak_concurrent_subscribe_unsubscribe() {
     );
 }
 
+
+
 // ==================== Forward/Pipe Independence Tests ====================
 //
 // These tests verify that forward/pipe do NOT propagate closure to the target.
@@ -1336,6 +2106,36 @@ async fn soak_concurrent_subscribe_unsubscribe() {
 // one source should NOT close the target. Derived streams (filter, map, etc.)
 // handle closure propagation differently - they DO close their children.
 
+
+#[tokio::test]
+async fn test_derived_streams_propagate_closure() {
+    // Derived streams (filter, map, etc.) SHOULD propagate closure to children.
+    // This is different from forward/pipe which connect independent streams.
+
+    let parent = Relay::new();
+    let filtered = parent.filter::<String, _>(|_| true);
+    let mut sub = filtered.subscribe::<String>();
+
+    // Send a message to verify it works
+    parent.send("test".to_string()).await.unwrap();
+
+    let msg = tokio::time::timeout(Duration::from_millis(100), sub.recv())
+        .await
+        .unwrap();
+    assert_eq!(msg.as_deref(), Some(&"test".to_string()));
+
+    // Drop parent - derived stream should close
+    drop(parent);
+
+    // Subscription should close (receive None)
+    let closed = tokio::time::timeout(Duration::from_millis(500), sub.recv())
+        .await
+        .expect("should not timeout - closure should propagate to derived");
+    assert!(
+        closed.is_none(),
+        "derived subscription should close when parent dropped"
+    );
+}
 
 // ============================================================================
 // DUPLEX TRANSFORM UTILITY TESTS
@@ -1418,10 +2218,59 @@ async fn test_duplex_transform_chained() {
 */
 
 /* REMOVED: Duplex API no longer exists
+#[tokio::test]
+async fn test_duplex_filter_transform_matching() {
+    // Filter-transform: only transform positive i32 → String
+    let duplex = Duplex::new().filter_transform::<i32, String, _, _>(
+        |n| *n > 0,                     // predicate
+        |n| format!("positive: {}", n), // transform
+    );
+
+    let mut string_sub = duplex.output.subscribe::<String>();
+    let mut int_sub = duplex.output.subscribe::<i32>();
+
+    // Positive - transformed to String
+    duplex.input.send(42i32).await.unwrap();
+
+    let transformed = tokio::time::timeout(Duration::from_millis(100), string_sub.recv())
+        .await
+        .unwrap();
+    assert_eq!(transformed.as_deref(), Some(&"positive: 42".to_string()));
+
+    // Negative - passed through as i32
+    duplex.input.send(-5i32).await.unwrap();
+
+    let passthrough = tokio::time::timeout(Duration::from_millis(100), int_sub.recv())
+        .await
+        .unwrap();
+    assert_eq!(passthrough.as_deref(), Some(&-5i32));
+}
 
 */
 
 /* REMOVED: Duplex API no longer exists
+#[tokio::test]
+async fn test_duplex_filter_transform_other_types_passthrough() {
+    // Filter-transform on i32, String should pass through
+    let duplex = Duplex::new().filter_transform::<i32, String, _, _>(
+        |n| *n > 0,
+        |n| format!("num: {}", n),
+    );
+
+    let mut string_sub = duplex.output.subscribe::<String>();
+
+    // String type passes through unchanged (not the filter type)
+    duplex
+        .input
+        .send("hello".to_string())
+        .await
+        .unwrap();
+
+    let passthrough = tokio::time::timeout(Duration::from_millis(100), string_sub.recv())
+        .await
+        .unwrap();
+    assert_eq!(passthrough.as_deref(), Some(&"hello".to_string()));
+}
 
 */
 

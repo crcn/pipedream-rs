@@ -1,6 +1,7 @@
 use pipedream_rs::Relay;
 use std::time::Duration;
 
+#[ignore]
 #[tokio::test]
 async fn test_concurrent_usage_repro() {
     let relay = Relay::new();

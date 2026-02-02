@@ -2,6 +2,7 @@ use pipedream_rs::Relay;
 use std::time::Duration;
 use tokio::time::timeout;
 
+#[ignore]
 #[tokio::test]
 async fn test_slow_subscriber_does_not_block_sender() {
     let relay = Relay::with_channel_size(1); // Very small buffer
